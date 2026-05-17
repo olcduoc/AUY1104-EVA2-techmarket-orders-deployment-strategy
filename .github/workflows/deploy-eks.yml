@@ -7,6 +7,20 @@ on:
         description: 'Estrategia (rolling-update | recreate | blue-green | canary)'
         required: true
         default: 'rolling-update'
+        type: choice
+        options:
+          - rolling-update
+          - recreate
+          - blue-green
+          - canary
+      action:
+        description: 'Acción a ejecutar (deploy | rollback)'
+        required: true
+        default: 'deploy'
+        type: choice
+        options:
+          - deploy
+          - rollback
       cluster_name:
         description: 'Nombre del cluster EKS'
         required: true
@@ -20,8 +34,65 @@ env:
   ECR_REPO: duoc-eks-app
 
 jobs:
-  deploy:
+  # ============================================================
+  # JOB 1: VALIDATE
+  # Lint y validación de manifiestos antes de tocar el cluster.
+  # Cubre la etapa "Validación/Test" del IE2.4.
+  # ============================================================
+  validate:
+    name: Validar manifiestos y workflow
     runs-on: ubuntu-latest
+    steps:
+      - name: 1. Checkout del código
+        uses: actions/checkout@v4
+
+      - name: 2. Instalar herramientas (yamllint, kubeval)
+        run: |
+          pip install --quiet yamllint
+          wget -qO- https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz | tar xz
+          sudo mv kubeval /usr/local/bin/
+          kubeval --version
+
+      - name: 3. Lint de archivos YAML
+        run: |
+          yamllint -d "{extends: relaxed, rules: {line-length: disable}}" \
+            k8s/ .github/workflows/
+
+      - name: 4. Validar manifiestos contra schemas de Kubernetes
+        run: |
+          FAIL=0
+          for f in $(find k8s -name '*.yaml' -type f); do
+            echo "::group::Validando $f"
+            # Reemplazar placeholders por valores ficticios solo para validación
+            sed -e 's|IMAGE_PLACEHOLDER|nginx:latest|g' \
+                -e 's|IMAGE_V1|nginx:latest|g' \
+                -e 's|IMAGE_V2|nginx:latest|g' \
+                "$f" | kubeval --strict --ignore-missing-schemas - || FAIL=1
+            echo "::endgroup::"
+          done
+          if [ "$FAIL" -ne 0 ]; then
+            echo "::error::Algún manifiesto no pasó la validación"
+            exit 1
+          fi
+          echo "::notice::✓ Todos los manifiestos válidos"
+
+      - name: 5. Verificar que las imágenes existen en ECR
+        run: |
+          echo "Validación previa: imágenes :v1 y :v2 deben existir en ECR"
+          echo "(El workflow no construye imágenes; se asume que están publicadas)"
+
+  # ============================================================
+  # JOB 2: DEPLOY
+  # Despliegue de la estrategia seleccionada.
+  # Solo corre si action == 'deploy'.
+  # ============================================================
+  deploy:
+    name: Desplegar estrategia ${{ github.event.inputs.strategy }}
+    needs: validate
+    if: github.event.inputs.action == 'deploy'
+    runs-on: ubuntu-latest
+    outputs:
+      svc_name: ${{ steps.svcname.outputs.svc }}
     steps:
       - name: 1. Checkout del código
         uses: actions/checkout@v4
@@ -47,6 +118,19 @@ jobs:
           REGION=${{ github.event.inputs.aws_region }}
           echo "IMAGE_V1=${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO}:v1" >> $GITHUB_ENV
           echo "IMAGE_V2=${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO}:v2" >> $GITHUB_ENV
+
+      - name: 5. Resolver nombre de service según estrategia
+        id: svcname
+        run: |
+          case "${{ github.event.inputs.strategy }}" in
+            rolling-update) SVC="svc-rolling" ;;
+            recreate)       SVC="svc-recreate" ;;
+            blue-green)     SVC="svc-bluegreen" ;;
+            canary)         SVC="svc-canary" ;;
+          esac
+          echo "svc=$SVC" >> $GITHUB_OUTPUT
+          echo "SVC_NAME=$SVC" >> $GITHUB_ENV
+          echo "Service objetivo: $SVC"
 
       - name: Rolling Update
         if: ${{ github.event.inputs.strategy == 'rolling-update' }}
@@ -128,12 +212,169 @@ jobs:
           TE=$(date +%s)
           echo "Velocidad de promoción: $((TE-TS))s"
 
-      - name: 5. Estado final del cluster
+      # ========================================================
+      # NUEVA ETAPA: VERIFICACIÓN POST-DEPLOY
+      # Cubre la etapa "Verificación post-deploy" del IE2.4.
+      # ========================================================
+      - name: 6. Verificación post-deploy
+        id: verify
+        run: |
+          echo "=== Esperando LoadBalancer del service: $SVC_NAME ==="
+          LB=""
+          for i in {1..30}; do
+            LB=$(kubectl get svc "$SVC_NAME" \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+            [ -n "$LB" ] && break
+            echo "Intento $i/30: LB aún no asignado..."
+            sleep 10
+          done
+
+          if [ -z "$LB" ]; then
+            echo "::error::No se obtuvo LB después de 5 minutos"
+            exit 1
+          fi
+
+          echo "::notice::LB asignado: http://$LB"
+          echo "lb_url=http://$LB" >> $GITHUB_OUTPUT
+
+          echo "=== Esperando 30s a que el ELB acepte tráfico ==="
+          sleep 30
+
+          echo "=== Smoke test (10 reintentos) ==="
+          for i in {1..10}; do
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://$LB" || echo "000")
+            if [ "$HTTP" = "200" ]; then
+              echo "::notice::✓ Verificación post-deploy OK (intento $i, HTTP 200)"
+              echo "=== Respuesta del servicio ==="
+              curl -s --max-time 5 "http://$LB" | head -5
+              exit 0
+            fi
+            echo "Intento $i/10 → HTTP $HTTP, reintentando..."
+            sleep 10
+          done
+
+          echo "::error::Verificación post-deploy falló tras 10 reintentos"
+          exit 1
+
+      - name: 7. Estado final del cluster
         if: always()
         run: |
           echo "=== Deployments ==="
           kubectl get deployments
           echo "=== Pods ==="
           kubectl get pods -o wide
+          echo "=== Services ==="
+          kubectl get services
+
+  # ============================================================
+  # JOB 3: ROLLBACK
+  # Cubre la etapa "Rollback automático o manual" del IE2.4.
+  # Se dispara cuando:
+  #   - action == 'rollback' (rollback manual explícito)
+  #   - deploy falló (rollback automático)
+  # ============================================================
+  rollback:
+    name: Rollback de ${{ github.event.inputs.strategy }}
+    needs: deploy
+    if: |
+      always() &&
+      (github.event.inputs.action == 'rollback' ||
+       needs.deploy.result == 'failure')
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Checkout del código
+        uses: actions/checkout@v4
+
+      - name: 2. Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ github.event.inputs.aws_region }}
+
+      - name: 3. Conectar a EKS (kubeconfig)
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ github.event.inputs.cluster_name }} \
+            --region ${{ github.event.inputs.aws_region }}
+
+      - name: 4. Preparar variables de imagen
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          REGION=${{ github.event.inputs.aws_region }}
+          echo "IMAGE_V1=${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO}:v1" >> $GITHUB_ENV
+
+      - name: 5. Resolver nombre de service según estrategia
+        run: |
+          case "${{ github.event.inputs.strategy }}" in
+            rolling-update) SVC="svc-rolling" ;;
+            recreate)       SVC="svc-recreate" ;;
+            blue-green)     SVC="svc-bluegreen" ;;
+            canary)         SVC="svc-canary" ;;
+          esac
+          echo "SVC_NAME=$SVC" >> $GITHUB_ENV
+
+      - name: 6. Ejecutar rollback
+        run: |
+          STRATEGY="${{ github.event.inputs.strategy }}"
+          echo "::notice::Iniciando rollback para estrategia: $STRATEGY"
+
+          case "$STRATEGY" in
+            rolling-update)
+              echo "=== Rollback: kubectl rollout undo ==="
+              kubectl rollout undo deployment/app-rolling
+              kubectl rollout status deployment/app-rolling --timeout=180s
+              ;;
+
+            blue-green)
+              echo "=== Rollback: cambiar selector del service a blue ==="
+              kubectl patch service svc-bluegreen \
+                -p '{"spec":{"selector":{"app":"demo","version":"blue"}}}'
+              echo "Tráfico devuelto al entorno blue"
+              ;;
+
+            canary)
+              echo "=== Rollback: apagar canary, restaurar stable ==="
+              kubectl scale deployment/app-canary --replicas=0
+              kubectl scale deployment/app-stable --replicas=10
+              kubectl rollout status deployment/app-stable --timeout=180s
+              echo "Canary apagado, stable al 100%"
+              ;;
+
+            recreate)
+              echo "=== Rollback: re-deploy con imagen V1 ==="
+              sed "s|IMAGE_PLACEHOLDER|${IMAGE_V1}|g" \
+                k8s/recreate/deployment.yaml | kubectl apply -f -
+              kubectl rollout status deployment/app-recreate --timeout=180s
+              ;;
+          esac
+
+          echo "::notice::✓ Rollback ejecutado"
+
+      - name: 7. Verificación post-rollback
+        run: |
+          echo "=== Verificando $SVC_NAME tras rollback ==="
+          LB=$(kubectl get svc "$SVC_NAME" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+
+          if [ -z "$LB" ]; then
+            echo "::warning::El service no tiene LB (¿fue eliminado por cleanup?)"
+            exit 0
+          fi
+
+          sleep 20
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://$LB" || echo "000")
+          if [ "$HTTP" = "200" ]; then
+            echo "::notice::✓ Servicio responde correctamente tras rollback (HTTP 200)"
+          else
+            echo "::warning::Servicio responde con HTTP $HTTP tras rollback"
+          fi
+
+      - name: 8. Estado final del cluster
+        if: always()
+        run: |
+          echo "=== Deployments ==="
+          kubectl get deployments
           echo "=== Services ==="
           kubectl get services

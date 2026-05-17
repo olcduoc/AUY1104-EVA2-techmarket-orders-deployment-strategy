@@ -1,0 +1,7 @@
+
+# Backups locales
+*.bak
+
+# Binarios sueltos
+kubeval
+kubeval-linux-amd64.tar.gz
