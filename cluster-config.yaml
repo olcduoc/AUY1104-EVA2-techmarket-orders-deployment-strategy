@@ -28,7 +28,7 @@ managedNodeGroups:
     labels:
       role: worker
     tags:
-      lab: auy1104-act2.4
+      lab: AUY1104-EVA2
       managed-by: eksctl
 
 cloudWatch:
