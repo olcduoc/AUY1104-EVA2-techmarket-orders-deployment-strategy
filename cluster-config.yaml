@@ -9,28 +9,16 @@ metadata:
 iam:
   serviceRoleARN: arn:aws:iam::533267352641:role/LabRole
 
-vpc:
-  cidr: "10.42.0.0/16"
-  clusterEndpoints:
-    publicAccess: true
-    privateAccess: true
-
 managedNodeGroups:
   - name: ng-default
     instanceType: t3.medium
     desiredCapacity: 2
-    minSize: 1
-    maxSize: 3
+    minSize: 2
+    maxSize: 2
     volumeSize: 20
-    amiFamily: AmazonLinux2023
     iam:
       instanceRoleARN: arn:aws:iam::533267352641:role/LabRole
     labels:
       role: worker
     tags:
-      lab: AUY1104-EVA2
-      managed-by: eksctl
-
-cloudWatch:
-  clusterLogging:
-    enableTypes: []
+      nodegroup-name: ng-default

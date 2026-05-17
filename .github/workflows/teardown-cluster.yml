@@ -1,0 +1,116 @@
+name: Teardown EKS Cluster
+
+# ============================================================
+# Destruye el cluster EKS y opcionalmente el repo ECR.
+# Requiere escribir "DESTROY" en el input para evitar accidentes.
+# ============================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: 'Nombre del cluster a destruir'
+        required: true
+        default: 'duoc-eks-cluster-cli'
+      aws_region:
+        description: 'Región AWS'
+        required: true
+        default: 'us-east-1'
+      confirm:
+        description: 'Escribir DESTROY para confirmar'
+        required: true
+      delete_ecr:
+        description: 'También eliminar repositorio ECR'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+env:
+  ECR_REPO: duoc-eks-app
+
+jobs:
+  teardown:
+    name: Destruir infraestructura
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validar confirmación
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "DESTROY" ]; then
+            echo "::error::Debes escribir DESTROY (en mayúsculas) para confirmar"
+            exit 1
+          fi
+          echo "::notice::Confirmación recibida. Procediendo con teardown."
+
+      - uses: actions/checkout@v4
+
+      - name: Configurar AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ github.event.inputs.aws_region }}
+
+      - name: Instalar eksctl
+        run: |
+          ARCH=amd64
+          PLATFORM="$(uname -s)_$ARCH"
+          curl -sLO "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_${PLATFORM}.tar.gz"
+          tar -xzf "eksctl_${PLATFORM}.tar.gz" -C /tmp
+          sudo mv /tmp/eksctl /usr/local/bin
+          rm -f "eksctl_${PLATFORM}.tar.gz"
+
+      - name: Limpiar deployments y services del cluster
+        continue-on-error: true
+        run: |
+          aws eks update-kubeconfig \
+            --name "${{ github.event.inputs.cluster_name }}" \
+            --region "${{ github.event.inputs.aws_region }}" || true
+
+          kubectl delete deployment --all -n default --ignore-not-found=true || true
+          kubectl delete service --all -n default \
+            --field-selector metadata.name!=kubernetes \
+            --ignore-not-found=true || true
+
+          echo "Esperando 30s a que los ELBs liberen recursos..."
+          sleep 30
+          kubectl get svc,deploy || true
+
+      - name: Eliminar cluster (10-15 min)
+        run: |
+          eksctl delete cluster \
+            --name "${{ github.event.inputs.cluster_name }}" \
+            --region "${{ github.event.inputs.aws_region }}" \
+            --wait || true
+
+      - name: Verificar eliminación
+        run: |
+          if aws eks describe-cluster \
+               --name "${{ github.event.inputs.cluster_name }}" \
+               --region "${{ github.event.inputs.aws_region }}" >/dev/null 2>&1; then
+            echo "::warning::El cluster todavía aparece en AWS. Revisa CloudFormation manualmente."
+          else
+            echo "::notice::✓ Cluster eliminado correctamente"
+          fi
+
+      - name: Eliminar repo ECR (opcional)
+        if: github.event.inputs.delete_ecr == 'true'
+        run: |
+          aws ecr delete-repository \
+            --repository-name "$ECR_REPO" \
+            --region "${{ github.event.inputs.aws_region }}" \
+            --force || true
+          echo "::notice::✓ Repo ECR $ECR_REPO eliminado"
+
+      - name: Resumen
+        if: always()
+        run: |
+          echo "============================================"
+          echo "  Teardown AUY1104 EVA2 - Resumen"
+          echo "============================================"
+          echo "Cluster eliminado: ${{ github.event.inputs.cluster_name }}"
+          echo "Región:            ${{ github.event.inputs.aws_region }}"
+          echo "ECR eliminado:     ${{ github.event.inputs.delete_ecr }}"
