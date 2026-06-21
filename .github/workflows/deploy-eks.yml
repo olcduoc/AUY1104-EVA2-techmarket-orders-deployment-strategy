@@ -14,13 +14,15 @@ on:
           - blue-green
           - canary
       action:
-        description: 'Acción a ejecutar (deploy | rollback)'
+        description: 'Acción a ejecutar (deploy | rollback | feature-toggle | hotfix)'
         required: true
         default: 'deploy'
         type: choice
         options:
           - deploy
           - rollback
+          - feature-toggle
+          - hotfix
       cluster_name:
         description: 'Nombre del cluster EKS'
         required: true
@@ -29,6 +31,30 @@ on:
         description: 'Región AWS'
         required: true
         default: 'us-east-1'
+      flag_value:
+        description: '[Solo action=feature-toggle] Valor del flag NEW_CHECKOUT_FLOW (true | false)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      hotfix_target_deployment:
+        description: '[Solo action=hotfix] Deployment a parchar (ej. app-blue, app-green, app-rolling)'
+        required: false
+        default: 'app-blue'
+      hotfix_image_tag:
+        description: '[Solo action=hotfix] Tag de la imagen de hotfix publicada en ECR (ej. v1-hotfix)'
+        required: false
+        default: 'v1-hotfix'
+      simulate_failure:
+        description: '[Solo strategy=blue-green] true = despliega GREEN con la imagen v3-broken para simular un fallo de salud'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 env:
   ECR_REPO: duoc-eks-app
@@ -67,6 +93,7 @@ jobs:
             sed -e 's|IMAGE_PLACEHOLDER|nginx:latest|g' \
                 -e 's|IMAGE_V1|nginx:latest|g' \
                 -e 's|IMAGE_V2|nginx:latest|g' \
+                -e 's|IMAGE_V3_BROKEN|nginx:latest|g' \
                 "$f" | kubeval --strict --ignore-missing-schemas - || FAIL=1
             echo "::endgroup::"
           done
@@ -118,6 +145,7 @@ jobs:
           REGION=${{ github.event.inputs.aws_region }}
           echo "IMAGE_V1=${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO}:v1" >> $GITHUB_ENV
           echo "IMAGE_V2=${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO}:v2" >> $GITHUB_ENV
+          echo "IMAGE_V3_BROKEN=${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO}:v3-broken" >> $GITHUB_ENV
 
       - name: 5. Resolver nombre de service según estrategia
         id: svcname
@@ -170,9 +198,17 @@ jobs:
           kubectl apply -f k8s/blue-green/service.yaml
           kubectl rollout status deployment/app-blue --timeout=120s
 
-          echo "=== Desplegando GREEN (V2) en paralelo ==="
           T0=$(date +%s)
-          sed "s|IMAGE_V2|${IMAGE_V2}|g" k8s/blue-green/green.yaml | kubectl apply -f -
+          if [ "${{ github.event.inputs.simulate_failure }}" = "true" ]; then
+            echo "=== ⚠ SIMULACIÓN DE FALLA: desplegando GREEN con imagen v3-broken ==="
+            sed "s|IMAGE_V3_BROKEN|${IMAGE_V3_BROKEN}|g" k8s/blue-green/green-broken.yaml | kubectl apply -f -
+          else
+            echo "=== Desplegando GREEN (V2) en paralelo ==="
+            sed "s|IMAGE_V2|${IMAGE_V2}|g" k8s/blue-green/green.yaml | kubectl apply -f -
+          fi
+          # green-broken.yaml usa un readinessProbe en /healthz (siempre 200),
+          # por lo que el rollout se completa rápido aunque "/" esté roto:
+          # la falla real la atrapará el step "Verificación post-deploy".
           kubectl rollout status deployment/app-green --timeout=300s
           T1=$(date +%s)
           echo "Tiempo de despliegue green: $((T1-T0))s"
@@ -378,3 +414,143 @@ jobs:
           kubectl get deployments
           echo "=== Services ==="
           kubectl get services
+
+  # ============================================================
+  # JOB 4: FEATURE-TOGGLE   [NUEVO — EVA3]
+  # Activa/desactiva una funcionalidad vía ConfigMap, sin
+  # reconstruir ni redesplegar la imagen. MTTR esperado: < 30s.
+  # Cubre IL3.3 / IL3.4 (mecanismo de remediación "Feature Toggle").
+  # ============================================================
+  feature-toggle:
+    name: Feature Toggle (NEW_CHECKOUT_FLOW=${{ github.event.inputs.flag_value }})
+    needs: validate
+    if: github.event.inputs.action == 'feature-toggle'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Checkout del código
+        uses: actions/checkout@v4
+
+      - name: 2. Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ github.event.inputs.aws_region }}
+
+      - name: 3. Conectar a EKS (kubeconfig)
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ github.event.inputs.cluster_name }} \
+            --region ${{ github.event.inputs.aws_region }}
+
+      - name: 4. Aplicar ConfigMap base (si no existe aún)
+        run: |
+          kubectl apply -f k8s/feature-flags/configmap.yaml
+
+      - name: 5. Estado del flag ANTES del cambio
+        run: |
+          echo "=== ConfigMap feature-flags (antes) ==="
+          kubectl get configmap feature-flags -o yaml
+
+      - name: 6. Cambiar el estado del feature flag
+        run: |
+          T0=$(date +%s)
+          kubectl patch configmap feature-flags \
+            -p '{"data":{"NEW_CHECKOUT_FLOW":"${{ github.event.inputs.flag_value }}"}}'
+          echo "::notice::Flag NEW_CHECKOUT_FLOW actualizado a ${{ github.event.inputs.flag_value }}"
+
+          # El cambio de ConfigMap no se propaga solo: se reinicia el
+          # deployment para que los pods relean el valor (no se reconstruye
+          # ni redespliega la imagen).
+          if kubectl get deployment app-green-toggle >/dev/null 2>&1; then
+            kubectl rollout restart deployment/app-green-toggle
+            kubectl rollout status deployment/app-green-toggle --timeout=60s
+          else
+            echo "::warning::deployment/app-green-toggle no existe aún. Despliéguelo primero con k8s/feature-flags/green-toggle.yaml"
+          fi
+          T1=$(date +%s)
+          echo "Tiempo total feature-toggle (MTTR): $((T1-T0))s"
+
+      - name: 7. Estado del flag DESPUÉS del cambio
+        run: |
+          echo "=== ConfigMap feature-flags (después) ==="
+          kubectl get configmap feature-flags -o yaml
+          echo "=== Pods del deployment afectado ==="
+          kubectl get pods -l app=demo,version=green-toggle -o wide 2>/dev/null || true
+
+  # ============================================================
+  # JOB 5: HOTFIX   [NUEVO — EVA3]
+  # Parche rápido sobre la versión actualmente activa, sin pasar
+  # por el ciclo completo de validación del pipeline (build/push
+  # de la imagen de hotfix se asume ya publicado en ECR).
+  # Cubre IL3.3 / IL3.4 (mecanismo de remediación "Hotfix").
+  # ============================================================
+  hotfix:
+    name: Hotfix sobre ${{ github.event.inputs.hotfix_target_deployment }}
+    needs: validate
+    if: github.event.inputs.action == 'hotfix'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Checkout del código
+        uses: actions/checkout@v4
+
+      - name: 2. Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ github.event.inputs.aws_region }}
+
+      - name: 3. Conectar a EKS (kubeconfig)
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ github.event.inputs.cluster_name }} \
+            --region ${{ github.event.inputs.aws_region }}
+
+      - name: 4. Preparar imagen de hotfix
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          REGION=${{ github.event.inputs.aws_region }}
+          echo "IMAGE_HOTFIX=${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO}:${{ github.event.inputs.hotfix_image_tag }}" >> $GITHUB_ENV
+
+      - name: 5. Aplicar parche directo (kubectl set image)
+        run: |
+          T0=$(date +%s)
+          TARGET="${{ github.event.inputs.hotfix_target_deployment }}"
+          echo "::notice::Aplicando hotfix $IMAGE_HOTFIX sobre deployment/$TARGET"
+          kubectl set image "deployment/$TARGET" "web=$IMAGE_HOTFIX" --record
+          kubectl rollout status "deployment/$TARGET" --timeout=120s
+          T1=$(date +%s)
+          echo "Tiempo total hotfix (MTTR): $((T1-T0))s"
+
+      - name: 6. Verificación rápida post-hotfix
+        run: |
+          # Best-effort: intenta resolver el LB del service más probable.
+          for SVC in svc-bluegreen svc-rolling svc-recreate svc-canary; do
+            LB=$(kubectl get svc "$SVC" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+            [ -n "$LB" ] && break
+          done
+
+          if [ -z "$LB" ]; then
+            echo "::warning::No se pudo resolver un LoadBalancer activo para verificar"
+            exit 0
+          fi
+
+          sleep 15
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://$LB" || echo "000")
+          if [ "$HTTP" = "200" ]; then
+            echo "::notice::✓ Hotfix verificado (HTTP 200) en http://$LB"
+          else
+            echo "::error::Hotfix no verificado, HTTP $HTTP en http://$LB"
+            exit 1
+          fi
+
+      - name: 7. Estado final del cluster
+        if: always()
+        run: |
+          echo "=== Deployments ==="
+          kubectl get deployments
+          echo "=== Pods ==="
+          kubectl get pods -o wide

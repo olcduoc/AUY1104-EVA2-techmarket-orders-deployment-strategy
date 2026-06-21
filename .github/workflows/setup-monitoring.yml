@@ -1,0 +1,148 @@
+name: Configurar Monitoreo - CloudWatch + SNS
+
+# ============================================================
+# Workflow NUEVO — EVA3.
+# Crea (o reutiliza) la capa de detección/notificación nativa
+# de AWS que complementa el smoke test ya implementado en
+# deploy-eks.yml:
+#
+#   CloudWatch Alarm (UnHealthyHostCount del Load Balancer)
+#        -> SNS Topic -> Suscripción por correo
+#
+# NOTA TÉCNICA: los Services de tipo LoadBalancer en este
+# proyecto (k8s/*/service.yaml) no usan el AWS Load Balancer
+# Controller ni anotaciones de ALB, por lo que EKS aprovisiona
+# un Classic Load Balancer (CLB) por defecto. Por eso la alarma
+# usa el namespace "AWS/ELB" (no "AWS/ApplicationELB"). Si más
+# adelante se instala el AWS Load Balancer Controller y se migra
+# a un Ingress/Service anotado como ALB, esta alarma debe
+# recrearse contra "AWS/ApplicationELB" con dimensión TargetGroup.
+# ============================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      sns_email:
+        description: 'Correo a suscribir en el tópico SNS de alertas'
+        required: true
+      cluster_name:
+        description: 'Nombre del cluster EKS'
+        required: true
+        default: 'duoc-eks-cluster-cli'
+      aws_region:
+        description: 'Región AWS'
+        required: true
+        default: 'us-east-1'
+      service_name:
+        description: 'Service de Kubernetes a monitorear (debe ser type=LoadBalancer)'
+        required: true
+        default: 'svc-bluegreen'
+      sns_topic_name:
+        description: 'Nombre del tópico SNS'
+        required: true
+        default: 'techmarket-orders-alerts'
+      alarm_name:
+        description: 'Nombre de la alarma CloudWatch'
+        required: true
+        default: 'techmarket-orders-unhealthy-hosts'
+
+jobs:
+  setup-monitoring:
+    name: Crear alarma CloudWatch + tópico SNS
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ github.event.inputs.aws_region }}
+
+      - name: 2. Conectar a EKS (kubeconfig)
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ github.event.inputs.cluster_name }} \
+            --region ${{ github.event.inputs.aws_region }}
+
+      - name: 3. Crear (o reutilizar) el tópico SNS
+        run: |
+          TOPIC_ARN=$(aws sns create-topic \
+            --name "${{ github.event.inputs.sns_topic_name }}" \
+            --region "${{ github.event.inputs.aws_region }}" \
+            --query TopicArn --output text)
+          echo "TOPIC_ARN=$TOPIC_ARN" >> $GITHUB_ENV
+          echo "::notice::Tópico SNS: $TOPIC_ARN"
+
+      - name: 4. Suscribir el correo al tópico
+        run: |
+          aws sns subscribe \
+            --topic-arn "$TOPIC_ARN" \
+            --protocol email \
+            --notification-endpoint "${{ github.event.inputs.sns_email }}" \
+            --region "${{ github.event.inputs.aws_region }}"
+          echo "::notice::Suscripción creada. Revisa ${{ github.event.inputs.sns_email }} y confirma el correo de AWS antes de simular la falla."
+
+      - name: 5. Resolver el Load Balancer del Service
+        run: |
+          SVC="${{ github.event.inputs.service_name }}"
+          LB=""
+          for i in {1..18}; do
+            LB=$(kubectl get svc "$SVC" \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+            [ -n "$LB" ] && break
+            echo "Intento $i/18: esperando hostname del LB de $SVC..."
+            sleep 10
+          done
+          if [ -z "$LB" ]; then
+            echo "::error::El service $SVC no tiene LoadBalancer asignado. ¿Está desplegado?"
+            exit 1
+          fi
+          echo "LB_HOSTNAME=$LB" >> $GITHUB_ENV
+          echo "::notice::LoadBalancer detectado: $LB"
+
+      - name: 6. Resolver el LoadBalancerName (Classic ELB) a partir del DNS
+        run: |
+          REGION="${{ github.event.inputs.aws_region }}"
+          LB_NAME=$(aws elb describe-load-balancers \
+            --region "$REGION" \
+            --query "LoadBalancerDescriptions[?DNSName=='${LB_HOSTNAME}'].LoadBalancerName" \
+            --output text)
+          if [ -z "$LB_NAME" ] || [ "$LB_NAME" = "None" ]; then
+            echo "::error::No se encontró un Classic ELB con DNS $LB_HOSTNAME en $REGION"
+            echo "::error::Si el Service fue creado con el AWS Load Balancer Controller (ALB/NLB), adapta este step a 'aws elbv2 describe-load-balancers'."
+            exit 1
+          fi
+          echo "LB_NAME=$LB_NAME" >> $GITHUB_ENV
+          echo "::notice::LoadBalancerName: $LB_NAME"
+
+      - name: 7. Crear/actualizar la alarma CloudWatch (UnHealthyHostCount)
+        run: |
+          aws cloudwatch put-metric-alarm \
+            --alarm-name "${{ github.event.inputs.alarm_name }}" \
+            --alarm-description "Detecta hosts no saludables en el LB de TechMarket Orders (EVA3)" \
+            --namespace "AWS/ELB" \
+            --metric-name "UnHealthyHostCount" \
+            --dimensions Name=LoadBalancerName,Value="$LB_NAME" \
+            --statistic Average \
+            --period 60 \
+            --evaluation-periods 2 \
+            --threshold 1 \
+            --comparison-operator GreaterThanOrEqualToThreshold \
+            --treat-missing-data notBreaching \
+            --alarm-actions "$TOPIC_ARN" \
+            --ok-actions "$TOPIC_ARN" \
+            --region "${{ github.event.inputs.aws_region }}"
+          echo "::notice::✓ Alarma '${{ github.event.inputs.alarm_name }}' creada/actualizada sobre $LB_NAME"
+
+      - name: 8. Resumen
+        run: |
+          echo "================================================"
+          echo " Monitoreo configurado"
+          echo "================================================"
+          echo " Tópico SNS   : $TOPIC_ARN"
+          echo " Alarma       : ${{ github.event.inputs.alarm_name }}"
+          echo " LoadBalancer : $LB_NAME ($LB_HOSTNAME)"
+          echo "================================================"
+          echo "Recuerda confirmar la suscripción de correo antes de"
+          echo "simular el fallo, o la notificación no llegará."

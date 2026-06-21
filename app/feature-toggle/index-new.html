@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Orders - Nuevo checkout</title>
+  <style>
+    body { background:#0f766e; color:white; font-family:sans-serif; text-align:center; padding-top:15%; }
+    h1 { font-size:60px; margin:0; }
+    p  { font-size:22px; }
+    .badge { display:inline-block; padding:6px 18px; border-radius:999px; background:#115e59; margin-top:20px; }
+  </style>
+</head>
+<body>
+  <h1>TechMarket Orders</h1>
+  <p>Nuevo checkout en línea (NEW_CHECKOUT_FLOW = true)</p>
+  <div class="badge">Feature Toggle: ON — pod <span id="h"></span></div>
+  <script>document.getElementById('h').textContent = location.hostname;</script>
+</body>
+</html>

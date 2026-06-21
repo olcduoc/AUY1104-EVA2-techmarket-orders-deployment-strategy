@@ -1,0 +1,51 @@
+# Deployment de demostración para el mecanismo "Feature Toggle" (EVA3).
+# Es independiente de app-blue/app-green para no interferir con el
+# patrón Blue-Green ya evaluado en EVA2. Expone NEW_CHECKOUT_FLOW
+# como variable de entorno leída desde el ConfigMap feature-flags.
+#
+# Uso típico (ver job feature-toggle en deploy-eks.yml):
+#   1) kubectl apply -f k8s/feature-flags/configmap.yaml
+#   2) kubectl apply -f k8s/feature-flags/green-toggle.yaml
+#   3) kubectl patch configmap feature-flags -p '{"data":{"NEW_CHECKOUT_FLOW":"true"}}'
+#   4) kubectl rollout restart deployment/app-green-toggle
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-green-toggle
+  labels: { app: demo, version: green-toggle }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: demo, version: green-toggle }
+  template:
+    metadata:
+      labels: { app: demo, version: green-toggle }
+    spec:
+      containers:
+        - name: web
+          image: IMAGE_TOGGLE
+          envFrom:
+            - configMapRef:
+                name: feature-flags
+          ports: [{ containerPort: 80 }]
+          readinessProbe:
+            httpGet: { path: /, port: 80 }
+            initialDelaySeconds: 2
+            periodSeconds: 3
+---
+# Service interno (ClusterIP) para no consumir un Load Balancer
+# adicional. Para verla en vivo durante la defensa:
+#   kubectl port-forward svc/svc-feature-toggle 8080:80
+#   abrir http://localhost:8080
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-feature-toggle
+spec:
+  type: ClusterIP
+  selector:
+    app: demo
+    version: green-toggle
+  ports:
+    - port: 80
+      targetPort: 80

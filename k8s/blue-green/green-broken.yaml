@@ -1,0 +1,31 @@
+# Manifiesto NUEVO — EVA3.
+# Variante de green.yaml que despliega la imagen v3-broken para
+# simular, de forma controlada y reproducible, un "Fallo de salud
+# post-switch" (ver sección 2 del informe).
+#
+# El readinessProbe apunta a /healthz (siempre responde 200 en la
+# imagen v3-broken) para que kubectl rollout status se complete
+# rápido. La ruta "/" en cambio responde 500: es ahí donde el step
+# "Verificación post-deploy" de deploy-eks.yml detecta la falla real
+# y dispara el rollback automático.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-green
+  labels: { app: demo, version: green }
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: demo, version: green }
+  template:
+    metadata:
+      labels: { app: demo, version: green }
+    spec:
+      containers:
+        - name: web
+          image: IMAGE_V3_BROKEN
+          ports: [{ containerPort: 80 }]
+          readinessProbe:
+            httpGet: { path: /healthz, port: 80 }
+            initialDelaySeconds: 2
+            periodSeconds: 3

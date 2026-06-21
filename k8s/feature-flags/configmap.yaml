@@ -1,0 +1,14 @@
+# ConfigMap del mecanismo de remediación "Feature Toggle" (EVA3).
+# Cambiar este valor (vía kubectl patch, ver job feature-toggle en
+# deploy-eks.yml) NO reconstruye ni redespliega ninguna imagen:
+# solo se actualiza configuración y se reinicia el deployment para
+# que los pods relean la variable de entorno. MTTR esperado < 30s.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: feature-flags
+  labels:
+    app: demo
+    component: feature-flags
+data:
+  NEW_CHECKOUT_FLOW: "false"

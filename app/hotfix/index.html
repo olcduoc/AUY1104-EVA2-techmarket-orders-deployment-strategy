@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>App V1 - Hotfix</title>
+  <style>
+    body { background:#1e3a8a; color:white; font-family:sans-serif; text-align:center; padding-top:15%; }
+    h1 { font-size:120px; margin:0; }
+    p  { font-size:24px; }
+    .patch { display:inline-block; padding:6px 18px; border-radius:999px; background:#f59e0b; color:#1e293b; font-weight:bold; margin-top:16px; }
+  </style>
+</head>
+<body>
+  <h1>V1</h1>
+  <p>Versión inicial — pod: <span id="h"></span></p>
+  <div class="patch">HOTFIX aplicado</div>
+  <script>document.getElementById('h').textContent = location.hostname;</script>
+</body>
+</html>

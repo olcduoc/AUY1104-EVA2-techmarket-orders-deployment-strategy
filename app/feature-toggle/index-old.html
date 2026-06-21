@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Orders - Checkout clásico</title>
+  <style>
+    body { background:#334155; color:white; font-family:sans-serif; text-align:center; padding-top:15%; }
+    h1 { font-size:60px; margin:0; }
+    p  { font-size:22px; }
+    .badge { display:inline-block; padding:6px 18px; border-radius:999px; background:#475569; margin-top:20px; }
+  </style>
+</head>
+<body>
+  <h1>TechMarket Orders</h1>
+  <p>Checkout clásico (NEW_CHECKOUT_FLOW = false)</p>
+  <div class="badge">Feature Toggle: OFF — pod <span id="h"></span></div>
+  <script>document.getElementById('h').textContent = location.hostname;</script>
+</body>
+</html>
