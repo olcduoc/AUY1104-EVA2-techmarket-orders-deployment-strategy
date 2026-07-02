@@ -1,0 +1,117 @@
+name: Template - Despliegue Blue-Green
+
+on:
+  workflow_call:
+    inputs:
+      cluster_name:
+        required: true
+        type: string
+      aws_region:
+        required: true
+        type: string
+      image_tag:
+        required: false
+        type: string
+        default: 'v2'
+      simulate_failure:
+        required: false
+        type: string
+        default: 'false'
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AWS_SESSION_TOKEN:
+        required: true
+    outputs:
+      deploy_status:
+        description: "success o failure"
+        value: ${{ jobs.deploy.outputs.status }}
+      lb_url:
+        description: "URL del Load Balancer"
+        value: ${{ jobs.deploy.outputs.lb_url }}
+
+jobs:
+  deploy:
+    name: Desplegar Blue-Green
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.verify.outputs.status }}
+      lb_url: ${{ steps.verify.outputs.lb_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ inputs.aws_region }}
+
+      - name: Conectar a EKS
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ inputs.cluster_name }} \
+            --region ${{ inputs.aws_region }}
+
+      - name: Preparar variables de imagen
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          REGION=${{ inputs.aws_region }}
+          echo "IMAGE_V1=${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/duoc-eks-app:v1" >> $GITHUB_ENV
+          echo "IMAGE_V2=${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/duoc-eks-app:${{ inputs.image_tag }}" >> $GITHUB_ENV
+          echo "IMAGE_BROKEN=${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/duoc-eks-app:v3-broken" >> $GITHUB_ENV
+
+      - name: Desplegar BLUE (versión estable)
+        run: |
+          sed "s|IMAGE_V1|${IMAGE_V1}|g" k8s/blue-green/blue.yaml | kubectl apply -f -
+          kubectl apply -f k8s/blue-green/service.yaml
+          kubectl rollout status deployment/app-blue --timeout=120s
+          echo "::notice::BLUE desplegado y estable"
+
+      - name: Desplegar GREEN (nueva versión o versión rota)
+        run: |
+          if [ "${{ inputs.simulate_failure }}" = "true" ]; then
+            echo "::warning::SIMULANDO FALLA: desplegando imagen v3-broken"
+            sed "s|IMAGE_V3_BROKEN|${IMAGE_BROKEN}|g" \
+              k8s/blue-green/green-broken.yaml | kubectl apply -f -
+          else
+            sed "s|IMAGE_V2|${IMAGE_V2}|g" k8s/blue-green/green.yaml | kubectl apply -f -
+          fi
+          kubectl rollout status deployment/app-green --timeout=300s
+
+      - name: Esperar estabilización y hacer switch a GREEN
+        run: |
+          sleep 60
+          kubectl patch service svc-bluegreen \
+            -p '{"spec":{"selector":{"app":"demo","version":"green"}}}'
+          echo "::notice::Switch completado: tráfico apuntando a GREEN"
+
+      - name: Health Check post-despliegue (10 reintentos)
+        id: verify
+        run: |
+          LB=""
+          for i in {1..20}; do
+            LB=$(kubectl get svc svc-bluegreen \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+            [ -n "$LB" ] && break
+            sleep 10
+          done
+          echo "lb_url=http://$LB" >> $GITHUB_OUTPUT
+          sleep 20
+
+          for i in {1..10}; do
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://$LB/" || echo "000")
+            if [ "$HTTP" = "200" ]; then
+              echo "::notice::Health Check OK (HTTP 200) en intento $i"
+              echo "status=success" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "Intento $i/10: HTTP $HTTP — esperando..."
+            sleep 10
+          done
+
+          echo "::error::Health Check falló tras 10 intentos — triggering rollback"
+          echo "status=failure" >> $GITHUB_OUTPUT
+          exit 1

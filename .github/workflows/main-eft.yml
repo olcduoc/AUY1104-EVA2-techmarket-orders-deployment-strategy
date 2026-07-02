@@ -1,0 +1,67 @@
+name: EFT - Pipeline TechMarket Orders (Modular)
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: 'Nombre del cluster EKS'
+        required: true
+        default: 'duoc-eks-cluster-cli'
+      aws_region:
+        description: 'Región AWS'
+        required: true
+        default: 'us-east-1'
+      image_tag:
+        description: 'Tag de imagen GREEN a desplegar (v2, v1-hotfix, etc.)'
+        required: false
+        default: 'v2'
+      simulate_failure:
+        description: 'Simular falla en GREEN para demo de auto-healing'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+jobs:
+
+  # ── ETAPA 1: VALIDACIÓN ──────────────────────────────────────────
+  validate:
+    name: "1. Validar"
+    uses: ./.github/workflows/wf-validate.yml
+    with:
+      cluster_name: ${{ github.event.inputs.cluster_name }}
+      aws_region:   ${{ github.event.inputs.aws_region }}
+    secrets:
+      AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN:     ${{ secrets.AWS_SESSION_TOKEN }}
+
+  # ── ETAPA 2: DESPLIEGUE BLUE-GREEN ───────────────────────────────
+  deploy:
+    name: "2. Desplegar Blue-Green"
+    needs: validate
+    uses: ./.github/workflows/wf-deploy-bluegreen.yml
+    with:
+      cluster_name:     ${{ github.event.inputs.cluster_name }}
+      aws_region:       ${{ github.event.inputs.aws_region }}
+      image_tag:        ${{ github.event.inputs.image_tag }}
+      simulate_failure: ${{ github.event.inputs.simulate_failure }}
+    secrets:
+      AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN:     ${{ secrets.AWS_SESSION_TOKEN }}
+
+  # ── ETAPA 3: ROLLBACK AUTOMÁTICO (solo si deploy falló) ──────────
+  rollback:
+    name: "3. Rollback Automático (Auto-Healing)"
+    needs: deploy
+    if: failure()
+    uses: ./.github/workflows/wf-rollback.yml
+    with:
+      cluster_name: ${{ github.event.inputs.cluster_name }}
+      aws_region:   ${{ github.event.inputs.aws_region }}
+      reason:       "Health Check falló en el despliegue Green (simulate_failure=${{ github.event.inputs.simulate_failure }})"
+    secrets:
+      AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN:     ${{ secrets.AWS_SESSION_TOKEN }}

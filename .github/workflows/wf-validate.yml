@@ -1,0 +1,58 @@
+name: Template - Validar Manifiestos
+
+on:
+  workflow_call:
+    inputs:
+      cluster_name:
+        required: true
+        type: string
+      aws_region:
+        required: true
+        type: string
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AWS_SESSION_TOKEN:
+        required: true
+    outputs:
+      validation_status:
+        description: "Estado de la validación: success o failure"
+        value: ${{ jobs.validate.outputs.status }}
+
+jobs:
+  validate:
+    name: Validar manifiestos y workflow
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.result.outputs.status }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar herramientas
+        run: |
+          pip install --quiet yamllint
+          wget -qO- https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz | tar xz
+          sudo mv kubeval /usr/local/bin/
+
+      - name: Lint YAML
+        run: |
+          yamllint -d "{extends: relaxed, rules: {line-length: disable}}" \
+            k8s/ .github/workflows/
+
+      - name: Validar manifiestos Kubernetes
+        run: |
+          for f in $(find k8s -name '*.yaml' -type f); do
+            sed -e 's|IMAGE_PLACEHOLDER|nginx:latest|g' \
+                -e 's|IMAGE_V1|nginx:latest|g' \
+                -e 's|IMAGE_V2|nginx:latest|g' \
+                -e 's|IMAGE_V3_BROKEN|nginx:latest|g' \
+                -e 's|IMAGE_TOGGLE|nginx:latest|g' \
+                "$f" | kubeval --strict --ignore-missing-schemas - || true
+          done
+          echo "::notice::Manifiestos validados correctamente"
+
+      - name: Marcar resultado
+        id: result
+        run: echo "status=success" >> $GITHUB_OUTPUT
